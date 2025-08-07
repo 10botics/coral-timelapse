@@ -10,13 +10,16 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from googleapiclient.errors import HttpError
 import tempfile
 import shutil
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configuration
 SERVICE_ACCOUNT_FILE = 'service_account.json'  # Path to your service account key file
 SCOPES = ['https://www.googleapis.com/auth/drive']
-FOLDER_A_ID = 'FOLDER_A_ID'  # Replace with your folderA ID
-FOLDER_B_NAME = 'FOLDER_B_NAME'
-FOLDER_C_NAME = 'FOLDER_C_NAME'
+FOLDER_A_ID = os.getenv('FOLDER_A_ID')  # Load from .env file
+
 IMAGE_FOLDER_NAME = 'image'
 TIMELAPSE_FOLDER_NAME = 'timelapse'
 TEMP_DIR = tempfile.mkdtemp()
@@ -250,6 +253,12 @@ def delete_old_images(service, image_folder_id, end_time):
 
 def main():
     logger.info("===== Google Drive Timelapse Creator =====")
+    
+    # Validate environment variables
+    if not FOLDER_A_ID:
+        logger.error("FOLDER_A_ID is not set in .env file. Please set it to your Google Drive folder ID.")
+        return
+    
     try:
         service = authenticate()
         image_folder_id, hourly_folder_id, daily_folder_id, weekly_folder_id = get_folder_ids(service)

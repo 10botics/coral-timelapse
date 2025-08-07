@@ -4,3 +4,4 @@ google-api-python-client==2.149.0
 requests==2.32.3
 Pillow==10.4.0
 pytz==2024.2
+python-dotenv==1.0.0
