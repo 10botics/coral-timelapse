@@ -14,9 +14,9 @@ import shutil
 # Configuration
 SERVICE_ACCOUNT_FILE = 'service_account.json'  # Path to your service account key file
 SCOPES = ['https://www.googleapis.com/auth/drive']
-FOLDER_A_ID = 'PLEASE REPLACE ME'  # Replace with your folderA ID
-FOLDER_B_NAME = '10botics.com'
-FOLDER_C_NAME = 'cam1'
+FOLDER_A_ID = 'FOLDER_A_ID'  # Replace with your folderA ID
+FOLDER_B_NAME = 'FOLDER_B_NAME'
+FOLDER_C_NAME = 'FOLDER_C_NAME'
 IMAGE_FOLDER_NAME = 'image'
 TIMELAPSE_FOLDER_NAME = 'timelapse'
 TEMP_DIR = tempfile.mkdtemp()
