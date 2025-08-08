@@ -86,20 +86,79 @@ def find_or_create_folder(service, parent_id, folder_name):
         logger.error(f"Error in find_or_create_folder for {folder_name}: {str(e)}")
         raise
 
-def get_folder_ids(service):
-    if not verify_folder_access(service, FOLDER_A_ID):
-        raise ValueError(f"Cannot access folder with ID: {FOLDER_A_ID}")
-    folder_b_id = find_or_create_folder(service, FOLDER_A_ID, FOLDER_B_NAME)
-    folder_c_id = find_or_create_folder(service, folder_b_id, FOLDER_C_NAME)
-    image_folder_id = find_or_create_folder(service, folder_c_id, IMAGE_FOLDER_NAME)
-    timelapse_folder_id = find_or_create_folder(service, folder_c_id, TIMELAPSE_FOLDER_NAME)
-    
-    # Create subfolders for hourly, daily, and weekly videos
+def list_subfolders(service, parent_id):
+    try:
+        query = (
+            f"'{parent_id}' in parents and "
+            "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        )
+        results = service.files().list(
+            q=query,
+            fields="files(id, name)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+        folders = results.get('files', [])
+        logger.info(f"Found {len(folders)} subfolders under parent ID: {parent_id}")
+        return folders
+    except HttpError as e:
+        logger.error(f"Error listing subfolders under {parent_id}: {str(e)}")
+        return []
+
+def get_or_create_camera_folders(service, camera_folder_id):
+    image_folder_id = find_or_create_folder(service, camera_folder_id, IMAGE_FOLDER_NAME)
+    timelapse_folder_id = find_or_create_folder(service, camera_folder_id, TIMELAPSE_FOLDER_NAME)
     hourly_folder_id = find_or_create_folder(service, timelapse_folder_id, 'hourly')
     daily_folder_id = find_or_create_folder(service, timelapse_folder_id, 'daily')
     weekly_folder_id = find_or_create_folder(service, timelapse_folder_id, 'weekly')
-    
     return image_folder_id, hourly_folder_id, daily_folder_id, weekly_folder_id
+
+def process_camera(service, camera_folder_id, image_folder_id, hourly_folder_id, daily_folder_id, weekly_folder_id, now):
+    subfolder_ids = {
+        'hourly': hourly_folder_id,
+        'daily': daily_folder_id,
+        'weekly': weekly_folder_id
+    }
+
+    video_types = [
+        ('hourly', get_hourly_video_info),
+        ('daily', get_daily_video_info),
+        ('weekly', get_weekly_video_info)
+    ]
+
+    for video_type, get_info in video_types:
+        start_time, end_time, video_name, desired_duration = get_info(now)
+        subfolder_id = subfolder_ids[video_type]
+        if video_exists(service, subfolder_id, video_name):
+            logger.info(f"{video_type} video {video_name} already exists in folder {subfolder_id}, skipping.")
+            continue
+
+        temp_dir = os.path.join(TEMP_DIR, f"{video_type}_{camera_folder_id}")
+        os.makedirs(temp_dir, exist_ok=True)
+        try:
+            image_paths = download_images(service, image_folder_id, start_time, end_time, temp_dir)
+
+            if len(image_paths) < IMAGE_THRESHOLDS[video_type]:
+                logger.info(
+                    f"Not enough images for {video_type} video: {len(image_paths)} < {IMAGE_THRESHOLDS[video_type]}, skipping."
+                )
+                continue
+
+            output_video = os.path.join(TEMP_DIR, f"{video_type}_output.mp4")
+            if create_video(image_paths, output_video, desired_duration):
+                upload_video(service, subfolder_id, output_video, video_name)
+                logger.info(f"Created and uploaded {video_type} video {video_name}.")
+
+                # Cleanup lower-tier artifacts per camera
+                if video_type == 'daily':
+                    delete_videos_in_folder(service, subfolder_ids['hourly'])
+                elif video_type == 'weekly':
+                    delete_videos_in_folder(service, subfolder_ids['daily'])
+                    delete_old_images(service, image_folder_id, end_time)
+            else:
+                logger.error(f"Failed to create {video_type} video {video_name}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 def get_hourly_video_info(now):
     start_time = (now - timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
@@ -253,62 +312,38 @@ def delete_old_images(service, image_folder_id, end_time):
 
 def main():
     logger.info("===== Google Drive Timelapse Creator =====")
-    
-    # Validate environment variables
-    if not FOLDER_A_ID:
-        logger.error("FOLDER_A_ID is not set in .env file. Please set it to your Google Drive folder ID.")
-        return
-    
     try:
         service = authenticate()
-        image_folder_id, hourly_folder_id, daily_folder_id, weekly_folder_id = get_folder_ids(service)
+        if not verify_folder_access(service, FOLDER_A_ID):
+            raise ValueError(f"Cannot access folder with ID: {FOLDER_A_ID}")
         hkt = pytz.timezone('Asia/Hong_Kong')
         now = datetime.now(hkt)
         logger.info(f"Current time (HKT): {now}")
 
-        subfolder_ids = {
-            'hourly': hourly_folder_id,
-            'daily': daily_folder_id,
-            'weekly': weekly_folder_id
-        }
-
-        video_types = [
-            ('hourly', get_hourly_video_info),
-            ('daily', get_daily_video_info),
-            ('weekly', get_weekly_video_info)
-        ]
-
-        for video_type, get_info in video_types:
-            start_time, end_time, video_name, desired_duration = get_info(now)
-            subfolder_id = subfolder_ids[video_type]
-            if video_exists(service, subfolder_id, video_name):
-                logger.info(f"{video_type} video {video_name} already exists in {video_type} folder, skipping.")
+        # Iterate all Location folders under the root folder
+        locations = list_subfolders(service, FOLDER_A_ID)
+        if not locations:
+            logger.info("No location folders found under the root folder. Nothing to process.")
+        for location in locations:
+            logger.info(f"Processing location folder: {location['name']} ({location['id']})")
+            cameras = list_subfolders(service, location['id'])
+            if not cameras:
+                logger.info(f"No camera folders found under location: {location['name']}")
                 continue
-
-            temp_dir = os.path.join(TEMP_DIR, video_type)
-            os.makedirs(temp_dir, exist_ok=True)
-            image_paths = download_images(service, image_folder_id, start_time, end_time, temp_dir)
-            
-            if len(image_paths) < IMAGE_THRESHOLDS[video_type]:
-                logger.info(f"Not enough images for {video_type} video: {len(image_paths)} < {IMAGE_THRESHOLDS[video_type]}, skipping.")
-                shutil.rmtree(temp_dir)
-                continue
-
-            output_video = os.path.join(TEMP_DIR, f"{video_type}_output.mp4")
-            if create_video(image_paths, output_video, desired_duration):
-                upload_video(service, subfolder_id, output_video, video_name)
-                logger.info(f"Created and uploaded {video_type} video {video_name} to {video_type} folder")
-                
-                # Delete videos in lower-tier folders
-                if video_type == 'daily':
-                    delete_videos_in_folder(service, subfolder_ids['hourly'])
-                elif video_type == 'weekly':
-                    delete_videos_in_folder(service, subfolder_ids['daily'])
-                    delete_old_images(service, image_folder_id, end_time)
-            else:
-                logger.error(f"Failed to create {video_type} video {video_name}")
-
-            shutil.rmtree(temp_dir)
+            for camera in cameras:
+                logger.info(f"Processing camera folder: {camera['name']} ({camera['id']})")
+                image_folder_id, hourly_folder_id, daily_folder_id, weekly_folder_id = get_or_create_camera_folders(
+                    service, camera['id']
+                )
+                process_camera(
+                    service,
+                    camera['id'],
+                    image_folder_id,
+                    hourly_folder_id,
+                    daily_folder_id,
+                    weekly_folder_id,
+                    now,
+                )
     except Exception as e:
         logger.error(f"Critical error: {str(e)}")
         import traceback
