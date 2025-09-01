@@ -207,46 +207,7 @@ def get_or_create_camera_folders(service, camera_folder_id):
     timelapse_folder_id = find_or_create_folder(service, camera_folder_id, TIMELAPSE_FOLDER_NAME)
     return image_folder_id, timelapse_folder_id
 
-def process_camera(service, camera_folder_id, image_folder_id, timelapse_folder_id, now):
-    """Process a single camera to create one timelapse video"""
-    try:
-        # Generate video name with timestamp (removing hourly/daily/weekly prefixes)
-        video_name = f"timelapse_{now.strftime('%Y%m%d_%H%M%S')}.mp4"
-        
-        # Check if video already exists
-        if video_exists(service, timelapse_folder_id, video_name):
-            logger.info(f"Timelapse video {video_name} already exists, skipping.")
-            return
 
-        # Get all images from the local image folder
-        logger.info(f"Starting image processing for camera {camera_folder_id}...")
-        image_paths = get_all_images_from_folder()
-        
-        if not image_paths:
-            logger.info(f"No images found for camera {camera_folder_id}, skipping.")
-            return
-        
-        # Limit images to maximum allowed
-        if len(image_paths) > MAX_IMAGES_PER_VIDEO:
-            logger.info(f"Image count ({len(image_paths)}) exceeds maximum ({MAX_IMAGES_PER_VIDEO})")
-            logger.info(f"Limiting to first {MAX_IMAGES_PER_VIDEO} images")
-            image_paths = image_paths[:MAX_IMAGES_PER_VIDEO]
-        
-        logger.info(f"Proceeding with {len(image_paths)} images for timelapse creation")
-        
-        # Create video
-        logger.info(f"Starting video creation process for camera {camera_folder_id}...")
-        output_video = os.path.join(TEMP_DIR, f"timelapse_output_{camera_folder_id}.mp4")
-        
-        if create_video(image_paths, output_video, None):  # Duration not used with fixed FPS
-            logger.info(f"Video creation successful, starting upload...")
-            upload_video(service, timelapse_folder_id, output_video, video_name)
-            logger.info(f"✅ Successfully created and uploaded timelapse video: {video_name}")
-        else:
-            logger.error(f"❌ Failed to create timelapse video: {video_name}")
-            
-    except Exception as e:
-        logger.error(f"Error processing camera {camera_folder_id}: {str(e)}")
 
 def get_all_images_from_folder(domain_name=None, camera_name=None):
     """Get all images from the local image folder following Google Drive structure"""
@@ -282,6 +243,425 @@ def get_all_images_from_folder(domain_name=None, camera_name=None):
         logger.error(f"❌ Error reading local image folder: {str(e)}")
         return []
 
+def get_images_from_local_storage_by_domain_camera(domain_name, camera_name):
+    """Get images from local storage using Google Drive folder structure"""
+    try:
+        local_path = os.path.join(LOCAL_IMAGE_FOLDER, domain_name, camera_name)
+        logger.info(f"🔍 Searching local storage: {local_path}")
+        
+        # Check if the domain/camera folder exists locally
+        full_path = os.path.join(os.getcwd(), local_path)
+        if not os.path.exists(full_path):
+            logger.warning(f"📁 Local folder not found: {full_path}")
+            logger.info(f"💡 This folder will be created when images are synchronized")
+            return []
+        
+        # Get images from the specific domain/camera folder
+        image_paths = get_all_images_from_folder(domain_name, camera_name)
+        
+        if image_paths:
+            logger.info(f"✅ Found {len(image_paths)} images in local storage: {domain_name}/{camera_name}")
+        else:
+            logger.info(f"📁 No images found in local storage: {domain_name}/{camera_name}")
+        
+        return image_paths
+        
+    except Exception as e:
+        logger.error(f"❌ Error accessing local storage for {domain_name}/{camera_name}: {str(e)}")
+        return []
+
+def get_google_drive_images(service, image_folder_id):
+    """Get list of images from Google Drive image folder"""
+    try:
+        logger.info(f"🔍 Fetching images from Google Drive folder ID: {image_folder_id}")
+        
+        images = []
+        page_token = None
+        
+        while True:
+            try:
+                # Use the same query format as the original working script
+                query = f"'{image_folder_id}' in parents and (mimeType='image/jpeg' or mimeType='image/png' or mimeType='image/jpg') and trashed=false"
+                logger.debug(f"🔍 Google Drive query: {query}")
+                
+                results = service.files().list(
+                    q=query,
+                    pageSize=1000,
+                    pageToken=page_token,
+                    fields="nextPageToken, files(id, name, createdTime, size)",
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True
+                ).execute()
+                
+                files = results.get('files', [])
+                for file in files:
+                    images.append({
+                        'id': file['id'],
+                        'name': file['name'],
+                        'createdTime': file.get('createdTime', ''),
+                        'size': int(file.get('size', 0))
+                    })
+                
+                page_token = results.get('nextPageToken')
+                if not page_token:
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Error fetching Google Drive images: {str(e)}")
+                break
+        
+        logger.info(f"📊 Found {len(images)} images in Google Drive")
+        return images
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to get Google Drive images: {str(e)}")
+        return []
+
+def get_local_storage_info_by_domain_camera(domain_name, camera_name):
+    """Get information about images in local storage for specific domain/camera"""
+    try:
+        local_image_folder = os.path.join(os.getcwd(), LOCAL_IMAGE_FOLDER, domain_name, camera_name)
+        
+        if not os.path.exists(local_image_folder):
+            logger.warning(f"Local image folder not found: {local_image_folder}")
+            return {'count': 0, 'size': 0, 'files': []}
+        
+        image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif')
+        local_files = []
+        total_size = 0
+        
+        for file in os.listdir(local_image_folder):
+            if file.lower().endswith(image_extensions):
+                file_path = os.path.join(local_image_folder, file)
+                try:
+                    file_size = os.path.getsize(file_path)
+                    file_stat = os.stat(file_path)
+                    local_files.append({
+                        'name': file,
+                        'path': file_path,
+                        'size': file_size,
+                        'modified': file_stat.st_mtime
+                    })
+                    total_size += file_size
+                except OSError:
+                    logger.warning(f"Could not access file: {file}")
+        
+        # Sort by modification time (oldest first)
+        local_files.sort(key=lambda x: x['modified'])
+        
+        logger.info(f"📁 Local storage ({domain_name}/{camera_name}): {len(local_files)} images, {total_size / (1024*1024):.2f} MB")
+        return {
+            'count': len(local_files),
+            'size': total_size,
+            'files': local_files
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting local storage info for {domain_name}/{camera_name}: {str(e)}")
+        return {'count': 0, 'size': 0, 'files': []}
+
+def identify_new_images(google_drive_images, local_storage_info):
+    """Identify images that exist in Google Drive but not in local storage"""
+    try:
+        local_file_names = {os.path.splitext(f['name'])[0] for f in local_storage_info['files']}
+        new_images = []
+        
+        for gd_image in google_drive_images:
+            gd_name = os.path.splitext(gd_image['name'])[0]
+            if gd_name not in local_file_names:
+                new_images.append(gd_image)
+        
+        logger.info(f"🆕 Found {len(new_images)} new images to download")
+        return new_images
+        
+    except Exception as e:
+        logger.error(f"❌ Error identifying new images: {str(e)}")
+        return []
+
+def download_new_images(service, new_images, local_image_folder):
+    """Download new images from Google Drive to local storage"""
+    try:
+        if not new_images:
+            logger.info("📥 No new images to download")
+            return 0
+        
+        logger.info(f"📥 Downloading {len(new_images)} new images...")
+        downloaded_count = 0
+        
+        for idx, image in enumerate(new_images, 1):
+            try:
+                logger.info(f"📥 Downloading {idx}/{len(new_images)}: {image['name']}")
+                
+                # Download the file
+                request = service.files().get_media(fileId=image['id'])
+                file_path = os.path.join(local_image_folder, image['name'])
+                
+                with open(file_path, 'wb') as f:
+                    downloader = MediaIoBaseDownload(f, request)
+                    done = False
+                    while not done:
+                        status, done = downloader.next_chunk()
+                        if status:
+                            logger.debug(f"Downloaded {int(status.progress() * 100)}% of {image['name']}")
+                
+                downloaded_count += 1
+                logger.info(f"✅ Downloaded: {image['name']}")
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to download {image['name']}: {str(e)}")
+                continue
+        
+        logger.info(f"📥 Download complete: {downloaded_count}/{len(new_images)} images downloaded")
+        return downloaded_count
+        
+    except Exception as e:
+        logger.error(f"❌ Error downloading new images: {str(e)}")
+        return 0
+
+def cleanup_old_images(local_storage_info, max_images):
+    """Remove old images if total count exceeds maximum allowed"""
+    try:
+        current_count = local_storage_info['count']
+        
+        if current_count <= max_images:
+            logger.info(f"📁 Local storage has {current_count} images, within limit of {max_images}")
+            return 0
+        
+        images_to_remove = current_count - max_images
+        logger.info(f"🧹 Need to remove {images_to_remove} old images to stay within limit of {max_images}")
+        
+        # Remove oldest images first (they're sorted by modification time)
+        removed_count = 0
+        for image in local_storage_info['files'][:images_to_remove]:
+            try:
+                os.remove(image['path'])
+                removed_count += 1
+                logger.info(f"🗑️ Removed old image: {image['name']}")
+            except OSError as e:
+                logger.error(f"❌ Failed to remove {image['name']}: {str(e)}")
+        
+        logger.info(f"🧹 Cleanup complete: removed {removed_count} old images")
+        return removed_count
+        
+    except Exception as e:
+        logger.error(f"❌ Error during cleanup: {str(e)}")
+        return 0
+
+def cleanup_google_drive_overflow(service, image_folder_id, max_images):
+    """Remove overflow images from Google Drive to maintain maximum count"""
+    try:
+        logger.info(f"🧹 Cleaning up Google Drive overflow to maintain {max_images} images...")
+        
+        # Get all images from Google Drive, sorted by modification time (oldest first)
+        query = f"'{image_folder_id}' in parents and (mimeType='image/jpeg' or mimeType='image/png' or mimeType='image/jpg') and trashed=false"
+        results = service.files().list(
+            q=query,
+            fields="files(id, name, createdTime, modifiedTime, size)",
+            orderBy="modifiedTime asc",  # Oldest first for overflow removal
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+        
+        all_images = results.get('files', [])
+        total_images = len(all_images)
+        
+        if total_images <= max_images:
+            logger.info(f"✅ Google Drive has {total_images} images, within limit of {max_images}")
+            return 0
+        
+        # Calculate how many to remove
+        images_to_remove = total_images - max_images
+        logger.info(f"🧹 Need to remove {images_to_remove} oldest images from Google Drive")
+        
+        # Remove oldest images first (they're at the beginning of the list due to orderBy="modifiedTime asc")
+        removed_count = 0
+        for image in all_images[:images_to_remove]:
+            try:
+                logger.info(f"🗑️ Deleting overflow image: {image['name']} (ID: {image['id']})")
+                service.files().delete(fileId=image['id'], supportsAllDrives=True).execute()
+                removed_count += 1
+                logger.info(f"✅ Deleted: {image['name']}")
+            except Exception as delete_error:
+                logger.error(f"❌ Failed to delete {image['name']}: {str(delete_error)}")
+                continue
+        
+        logger.info(f"🧹 Google Drive overflow cleanup complete: removed {removed_count} oldest images")
+        logger.info(f"📊 Remaining images in Google Drive: {total_images - removed_count}")
+        
+        return removed_count
+        
+    except Exception as e:
+        logger.error(f"❌ Error during Google Drive overflow cleanup: {str(e)}")
+        return 0
+
+def cleanup_overflow_images(service, image_folder_id, domain_name, camera_name, max_images):
+    """Comprehensive cleanup of overflow images in both Google Drive and local storage"""
+    try:
+        logger.info(f"🧹 Starting comprehensive overflow cleanup for {domain_name}/{camera_name}...")
+        logger.info(f"📏 Target maximum images: {max_images}")
+        
+        # Step 1: Check local storage overflow
+        local_storage_info = get_local_storage_info_by_domain_camera(domain_name, camera_name)
+        local_overflow = max(0, local_storage_info['count'] - max_images)
+        
+        if local_overflow > 0:
+            logger.info(f"📁 Local storage overflow: {local_overflow} images")
+            logger.info(f"🧹 Cleaning up local storage overflow...")
+            local_removed = cleanup_old_images(local_storage_info, max_images)
+            logger.info(f"✅ Local storage cleanup: removed {local_removed} overflow images")
+        else:
+            logger.info(f"✅ Local storage within limit: {local_storage_info['count']} images")
+        
+        # Step 2: Check Google Drive overflow
+        google_drive_images = get_google_drive_images(service, image_folder_id)
+        gd_overflow = max(0, len(google_drive_images) - max_images)
+        
+        if gd_overflow > 0:
+            logger.info(f"☁️ Google Drive overflow: {gd_overflow} images")
+            logger.info(f"🧹 Cleaning up Google Drive overflow...")
+            gd_removed = cleanup_google_drive_overflow(service, image_folder_id, max_images)
+            logger.info(f"✅ Google Drive cleanup: removed {gd_removed} overflow images")
+        else:
+            logger.info(f"✅ Google Drive within limit: {len(google_drive_images)} images")
+        
+        # Step 3: Final verification
+        final_local = get_local_storage_info_by_domain_camera(domain_name, camera_name)
+        final_gd = get_google_drive_images(service, image_folder_id)
+        
+        logger.info(f"📊 Final cleanup results:")
+        logger.info(f"   • Local storage: {final_local['count']} images")
+        logger.info(f"   • Google Drive: {len(final_gd)} images")
+        logger.info(f"   • Target limit: {max_images} images")
+        
+        total_removed = local_overflow + gd_overflow
+        logger.info(f"✅ Comprehensive overflow cleanup complete: {total_removed} total images removed")
+        
+        return {
+            'local_removed': local_overflow,
+            'gd_removed': gd_overflow,
+            'total_removed': total_removed
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error during comprehensive overflow cleanup: {str(e)}")
+        return {'local_removed': 0, 'gd_removed': 0, 'total_removed': 0}
+
+def synchronize_images(service, image_folder_id, domain_name, camera_name):
+    """Main function to synchronize local storage with Google Drive"""
+    try:
+        logger.info("🔄 Starting image synchronization process...")
+        logger.info(f"🎯 Target: Keep local storage synchronized with Google Drive")
+        logger.info(f"📏 Maximum images allowed: {MAX_IMAGES_PER_VIDEO}")
+        logger.info(f"📂 Domain/Camera: {domain_name}/{camera_name}")
+        
+        # Step 1: CAPTURE SNAPSHOT of current state (don't re-count during process)
+        logger.info("📊 Step 1: Capturing snapshot of current state...")
+        google_drive_images = get_google_drive_images(service, image_folder_id)
+        local_storage_info = get_local_storage_info_by_domain_camera(domain_name, camera_name)
+        
+        # Store the initial counts for consistent decision making
+        initial_local_count = local_storage_info['count']
+        initial_gd_count = len(google_drive_images)
+        
+        logger.info(f"📸 Snapshot captured:")
+        logger.info(f"   • Local storage: {initial_local_count} images")
+        logger.info(f"   • Google Drive: {initial_gd_count} images")
+        logger.info(f"   • Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        if not google_drive_images:
+            logger.warning("⚠️ No images found in Google Drive, skipping synchronization")
+            return local_storage_info
+        
+        # Step 2: Identify new images using the snapshot
+        logger.info("🔍 Step 2: Identifying new images using snapshot...")
+        new_images = identify_new_images(google_drive_images, local_storage_info)
+        
+        # Step 3: Download new images FIRST (don't delete anything yet)
+        if new_images:
+            logger.info(f"📥 Step 3: Downloading {len(new_images)} new images FIRST...")
+            
+            # Create the full domain/camera path for downloads
+            local_image_folder = os.path.join(os.getcwd(), LOCAL_IMAGE_FOLDER, domain_name, camera_name)
+            
+            # Ensure local folder exists (create domain and camera subfolders)
+            os.makedirs(local_image_folder, exist_ok=True)
+            logger.info(f"📁 Downloading images to: {local_image_folder}")
+            
+            downloaded_count = download_new_images(service, new_images, local_image_folder)
+            
+            if downloaded_count > 0:
+                logger.info(f"✅ Downloaded {downloaded_count} new images successfully")
+            else:
+                logger.warning(f"⚠️ No images were downloaded")
+        else:
+            logger.info("✅ No new images to download")
+        
+        # Step 4: Calculate total using snapshot + downloads (consistent calculation)
+        logger.info("📊 Step 4: Calculating total using snapshot + downloads...")
+        total_after_download = initial_local_count + len(new_images)
+        
+        logger.info(f"📊 Post-download analysis (using snapshot):")
+        logger.info(f"   • Initial local count: {initial_local_count}")
+        logger.info(f"   • New images downloaded: {len(new_images)}")
+        logger.info(f"   • Total after download: {total_after_download}")
+        logger.info(f"   • Maximum allowed: {MAX_IMAGES_PER_VIDEO}")
+        logger.info(f"   • Overflow: {max(0, total_after_download - MAX_IMAGES_PER_VIDEO)} images")
+        
+        # Step 5: Clean up local storage overflow using snapshot-based calculation
+        if total_after_download > MAX_IMAGES_PER_VIDEO:
+            logger.info(f"🧹 Step 5: Cleaning up local storage overflow using snapshot...")
+            local_overflow = total_after_download - MAX_IMAGES_PER_VIDEO
+            logger.info(f"📁 Need to remove {local_overflow} overflow images from local storage")
+            
+            # Use the snapshot-based local storage info for cleanup
+            removed_count = cleanup_old_images(local_storage_info, MAX_IMAGES_PER_VIDEO)
+            logger.info(f"✅ Local storage cleanup: removed {removed_count} overflow images")
+        else:
+            logger.info(f"✅ Local storage within limit: {total_after_download} images")
+            local_overflow = 0
+        
+        # Step 6: Clean up Google Drive overflow using snapshot (consistent with local logic)
+        logger.info("🧹 Step 6: Cleaning up Google Drive overflow using snapshot...")
+        total_gd_images = initial_gd_count  # Use snapshot count
+        
+        logger.info(f"☁️ Google Drive analysis (using snapshot):")
+        logger.info(f"   • Total images: {total_gd_images}")
+        logger.info(f"   • Maximum allowed: {MAX_IMAGES_PER_VIDEO}")
+        logger.info(f"   • Overflow: {max(0, total_gd_images - MAX_IMAGES_PER_VIDEO)} images")
+        
+        if total_gd_images > MAX_IMAGES_PER_VIDEO:
+            gd_overflow = total_gd_images - MAX_IMAGES_PER_VIDEO
+            logger.info(f"☁️ Need to remove {gd_overflow} overflow images from Google Drive")
+            
+            gd_removed = cleanup_google_drive_overflow(service, image_folder_id, MAX_IMAGES_PER_VIDEO)
+            logger.info(f"✅ Google Drive cleanup: removed {gd_removed} overflow images")
+        else:
+            logger.info(f"✅ Google Drive within limit: {total_gd_images} images")
+            gd_removed = 0
+        
+        # Step 7: Final summary using snapshot-based results
+        logger.info("📋 Step 7: Synchronization summary (using snapshot)...")
+        
+        logger.info(f"📊 Final results (based on snapshot):")
+        logger.info(f"   • Google Drive: {total_gd_images} images (snapshot)")
+        logger.info(f"   • Local storage: {total_after_download} images (calculated)")
+        logger.info(f"   • Target limit: {MAX_IMAGES_PER_VIDEO}")
+        logger.info(f"🆕 New images downloaded: {len(new_images)}")
+        logger.info(f"🧹 Overflow cleanup results:")
+        logger.info(f"   • Local storage: {local_overflow} images removed")
+        logger.info(f"   • Google Drive: {gd_removed} images removed")
+        logger.info(f"   • Total: {local_overflow + gd_removed} images removed")
+        
+        logger.info("✅ Image synchronization complete!")
+        
+        # Return updated local storage info for the calling function
+        updated_local_info = get_local_storage_info_by_domain_camera(domain_name, camera_name)
+        return updated_local_info
+        
+    except Exception as e:
+        logger.error(f"❌ Image synchronization failed: {str(e)}")
+        return None
+
 def video_exists(service, folder_id, video_name):
     try:
         query = f"'{folder_id}' in parents and name = '{video_name}' and trashed = false"
@@ -296,43 +676,7 @@ def video_exists(service, folder_id, video_name):
         logger.error(f"Error checking video existence for {video_name}: {str(e)}")
         return False
 
-def download_images(service, image_folder_id, start_time, end_time, temp_dir):
-    try:
-        start_utc = start_time.astimezone(pytz.utc).isoformat().replace('+00:00', 'Z')
-        end_utc = end_time.astimezone(pytz.utc).isoformat().replace('+00:00', 'Z')
-        query = f"'{image_folder_id}' in parents and createdTime >= '{start_utc}' and createdTime < '{end_utc}' and (mimeType='image/jpeg' or mimeType='image/png' or mimeType='image/jpg')"
-        results = service.files().list(
-            q=query,
-            orderBy="createdTime",
-            fields="nextPageToken, files(id, name)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
-        ).execute()
-        files = results.get('files', [])
-        logger.info(f"Found {len(files)} images for period {start_time} to {end_time}")
-        image_paths = []
-        for idx, file in enumerate(files):
-            file_path = os.path.join(temp_dir, f"{idx:04d}.jpg")
-            request = service.files().get_media(fileId=file['id'])
-            fh = io.BytesIO()
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-                logger.debug(f"Downloaded {int(status.progress() * 100)}% of {file['name']}")
-            fh.seek(0)
-            with open(file_path, 'wb') as f:
-                f.write(fh.read())
-            if os.path.getsize(file_path) > 0:
-                image_paths.append(file_path)
-                logger.info(f"Saved image: {file_path}")
-            else:
-                logger.warning(f"Empty file downloaded: {file['name']}")
-                os.remove(file_path)
-        return image_paths
-    except HttpError as e:
-        logger.error(f"Error downloading images: {str(e)}")
-        return []
+
 
 def create_video(image_paths, output_video, desired_duration):
     if not image_paths:
@@ -513,43 +857,10 @@ def upload_video(service, folder_id, video_path, video_name):
     # If we get here, all retries failed
     raise Exception(f"Upload failed after {max_retries} attempts")
 
-def delete_videos_in_folder(service, folder_id):
-    try:
-        query = f"'{folder_id}' in parents and mimeType='video/mp4' and trashed = false"
-        results = service.files().list(
-            q=query,
-            fields="files(id)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
-        ).execute()
-        files = results.get('files', [])
-        for file in files:
-            service.files().delete(fileId=file['id'], supportsAllDrives=True).execute()
-            logger.info(f"Deleted video: {file['id']} from folder ID: {folder_id}")
-        logger.info(f"Deleted {len(files)} videos from folder ID: {folder_id}")
-    except HttpError as e:
-        logger.error(f"Error deleting videos from folder ID: {folder_id}: {str(e)}")
 
-def delete_old_images(service, image_folder_id, end_time):
-    try:
-        end_utc = end_time.astimezone(pytz.utc).isoformat().replace('+00:00', 'Z')
-        query = f"'{image_folder_id}' in parents and createdTime < '{end_utc}'"
-        results = service.files().list(
-            q=query,
-            fields="nextPageToken, files(id)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
-        ).execute()
-        files = results.get('files', [])
-        for file in files:
-            service.files().delete(fileId=file['id'], supportsAllDrives=True).execute()
-            logger.info(f"Deleted image: {file['id']}")
-        logger.info(f"Deleted {len(files)} images before {end_time}")
-    except HttpError as e:
-        logger.error(f"Error deleting images: {str(e)}")
 
 def main():
-    logger.info("===== Google Drive Timelapse Creator (Single Video Mode) =====")
+    logger.info("===== Google Drive Timelapse Creator (Domain/Camera Structure Mode) =====")
     try:
         # Check if root folder ID is configured
         if not FOLDER_A_ID:
@@ -559,7 +870,7 @@ def main():
         
         service = authenticate()
         
-        # Verify access to root folder
+        # Verify access to root folder (same as original script)
         if not verify_folder_access(service, FOLDER_A_ID):
             raise ValueError(f"Cannot access root folder with ID: {FOLDER_A_ID}")
         
@@ -567,40 +878,177 @@ def main():
         now = datetime.now(hkt)
         logger.info(f"Current time (HKT): {now}")
         
-        logger.info("=== SINGLE VIDEO TIMELAPSE CREATION STARTED ===")
+        logger.info("=== DOMAIN/CAMERA TIMELAPSE CREATION STARTED ===")
         logger.info(f"Root Folder ID: {FOLDER_A_ID}")
         logger.info(f"Local image folder: {LOCAL_IMAGE_FOLDER}")
         logger.info(f"Maximum images per video: {MAX_IMAGES_PER_VIDEO}")
         logger.info(f"Target FPS: 24")
+        logger.info(f"Image synchronization: {'Enabled' if ENABLE_IMAGE_SYNC else 'Disabled'}")
+        logger.info(f"Sync before video creation: {'Yes' if SYNC_BEFORE_VIDEO else 'No'}")
+        logger.info(f"Delete previous file: {'Yes' if DELETE_PREVIOUS_VIDEO else 'No'}")
+        logger.info(f"Cleanup unused images: {'Yes' if CLEANUP_UNUSED_IMAGES else 'No'}")
+        logger.info(f"Max Google Drive images: {MAX_GOOGLE_DRIVE_IMAGES}")
         logger.info("=" * 50)
         
-        # Iterate all Location folders under the root folder
+        # Find all domains and cameras (following Google Drive structure)
+        logger.info("🔍 Discovering domains and cameras in Google Drive...")
+        
+        # Get all location folders (like original script)
         locations = list_subfolders(service, FOLDER_A_ID)
         if not locations:
-            logger.info("No location folders found under the root folder. Nothing to process.")
+            logger.error("❌ No location folders found under root folder")
             return
-            
+        
+        domain_camera_pairs = []
         for location in locations:
-            logger.info(f"Processing location folder: {location['name']} ({location['id']})")
+            domain_name = location['name']
+            logger.info(f"🔍 Checking domain: {domain_name} ({location['id']})")
+            
             cameras = list_subfolders(service, location['id'])
-            if not cameras:
-                logger.info(f"No camera folders found under location: {location['name']}")
-                continue
-                
             for camera in cameras:
-                logger.info(f"Processing camera folder: {camera['name']} ({camera['id']})")
-                image_folder_id, timelapse_folder_id = get_or_create_camera_folders(service, camera['id'])
+                camera_name = camera['name']
+                logger.info(f"  📷 Found camera: {camera_name} ({camera['id']})")
                 
-                process_camera(
-                    service,
-                    camera['id'],
-                    image_folder_id,
-                    timelapse_folder_id,
-                    now,
-                )
+                # Check if this domain/camera combination has images locally
+                local_images = get_images_from_local_storage_by_domain_camera(domain_name, camera_name)
                 
+                if local_images:
+                    domain_camera_pairs.append({
+                        'domain': domain_name,
+                        'camera': camera_name,
+                        'folder_id': camera['id'],
+                        'local_images': local_images,
+                        'image_count': len(local_images)
+                    })
+                    logger.info(f"  ✅ {domain_name}/{camera_name}: {len(local_images)} images available locally")
+                else:
+                    logger.info(f"  ⏭️ {domain_name}/{camera_name}: No local images (skipping)")
+        
+        if not domain_camera_pairs:
+            logger.error("❌ No domain/camera combinations found with local images")
+            logger.error("💡 Make sure images are synchronized to local storage first")
+            return
+        
+        logger.info(f"📊 Found {len(domain_camera_pairs)} domain/camera combinations with local images")
+        
+        # For now, process the first available domain/camera (maintains current behavior)
+        # In the future, this will loop through all combinations
+        selected_pair = domain_camera_pairs[0]
+        domain_name = selected_pair['domain']
+        camera_name = selected_pair['camera']
+        camera_folder = {'id': selected_pair['folder_id'], 'name': camera_name}
+        
+        logger.info(f"🎯 Processing: {domain_name}/{camera_name} ({selected_pair['image_count']} images)")
+        
+        # Get or create the timelapse folder directly under the camera
+        logger.info(f"📁 Looking for timelapse folder in {camera_name}...")
+        logger.info(f"🔍 Searching for 'timelapse' folder under {camera_name} (ID: {camera_folder['id']})")
+        timelapse_folder_id = find_or_create_folder(service, camera_folder['id'], TIMELAPSE_FOLDER_NAME)
+        logger.info(f"✅ Timelapse folder ready: {timelapse_folder_id}")
+        logger.info(f"📂 Video will be uploaded to: {domain_name}/{camera_name}/timelapse/ folder")
+        
+        # Process the selected domain/camera
+        logger.info(f"📷 Processing {domain_name}/{camera_name}...")
+        
+        try:
+            # Step 1: Synchronize images between Google Drive and local storage (if enabled)
+            if ENABLE_IMAGE_SYNC and SYNC_BEFORE_VIDEO:
+                logger.info("🔄 Step 1: Starting image synchronization...")
+                
+                # Get the image folder ID for the camera
+                image_folder_id = find_or_create_folder(service, camera_folder['id'], IMAGE_FOLDER_NAME)
+                logger.info(f"📁 {camera_name} image folder ID: {image_folder_id}")
+                
+                # Synchronize images (download new ones, cleanup old ones)
+                sync_result = synchronize_images(service, image_folder_id, domain_name, camera_name)
+                
+                if sync_result is None:
+                    logger.error("❌ Image synchronization failed, cannot proceed with video creation")
+                    return
+                
+                logger.info(f"✅ Image synchronization completed successfully")
+                logger.info(f"📊 Local storage now has {sync_result['count']} images")
+            else:
+                logger.info("⏭️ Image synchronization skipped (disabled or not required)")
+                sync_result = None
+            
+            # Step 2: Get images from local storage (already discovered above)
+            logger.info("📁 Step 2: Using images from local storage...")
+            image_paths = selected_pair['local_images']
+            
+            if not image_paths:
+                logger.error(f"❌ No images found in local storage for {domain_name}/{camera_name}, cannot create timelapse")
+                return
+            
+            # Limit images to maximum allowed
+            if len(image_paths) > MAX_IMAGES_PER_VIDEO:
+                logger.info(f"Image count ({len(image_paths)}) exceeds maximum ({MAX_IMAGES_PER_VIDEO})")
+                logger.info(f"Limiting to first {MAX_IMAGES_PER_VIDEO} images")
+                image_paths = image_paths[:MAX_IMAGES_PER_VIDEO]
+            
+            logger.info(f"✅ Proceeding with {len(image_paths)} images from {domain_name}/{camera_name} for timelapse creation")
+            
+            # Store the names of images that will be used in the video (for cleanup later)
+            used_image_names = [os.path.basename(image_path) for image_path in image_paths]
+            logger.info(f"📋 Images to be used in timelapse: {len(used_image_names)}")
+            
+            # Create video
+            logger.info("🎬 Step 3: Starting video creation process...")
+            output_video = os.path.join(TEMP_DIR, f"{camera_name}_timelapse_output.mp4")
+            
+            if create_video(image_paths, output_video, None):  # Duration not used with fixed FPS
+                # Generate video name with timestamp
+                video_name = f"timelapse_{now.strftime('%Y%m%d_%H%M%S')}.mp4"
+                
+                logger.info("🎬 Step 4: Video creation successful, starting upload...")
+                logger.info(f"📤 Uploading video to Google Drive folder ID: {timelapse_folder_id}")
+                
+                try:
+                    upload_video(service, timelapse_folder_id, output_video, video_name)
+                    logger.info(f"✅ Successfully created and uploaded {camera_name} timelapse video: {video_name}")
+                    logger.info(f"📁 Video uploaded to: {domain_name}/{camera_name}/timelapse/ folder in Google Drive")
+                    logger.info(f"🎯 Final location: {domain_name}/{camera_name}/timelapse/{video_name}")
+                    
+                    # Step 5: Comprehensive overflow cleanup (ensure both locations stay within MAX_IMAGES_PER_VIDEO limit)
+                    logger.info("🧹 Step 5: Comprehensive overflow cleanup after video creation...")
+                    try:
+                        image_folder_id = find_or_create_folder(service, camera_folder['id'], IMAGE_FOLDER_NAME)
+                        overflow_cleanup_result = cleanup_overflow_images(
+                            service, 
+                            image_folder_id, 
+                            domain_name, 
+                            camera_name, 
+                            MAX_IMAGES_PER_VIDEO
+                        )
+                        logger.info(f"✅ Overflow cleanup completed:")
+                        logger.info(f"   • Local storage: {overflow_cleanup_result['local_removed']} images removed")
+                        logger.info(f"   • Google Drive: {overflow_cleanup_result['gd_removed']} images removed")
+                        logger.info(f"   • Total: {overflow_cleanup_result['total_removed']} images removed")
+                    except Exception as overflow_error:
+                        logger.warning(f"⚠️ Overflow cleanup failed: {str(overflow_error)}")
+                        logger.info("🔄 Continuing with final summary...")
+                        
+                except Exception as upload_error:
+                    logger.error(f"❌ Upload failed: {str(upload_error)}")
+                    logger.error(f"📁 Video file was created locally at: {output_video}")
+                    logger.error(f"💡 You can manually upload this file to Google Drive")
+                    logger.error(f"🔍 Upload error details: {type(upload_error).__name__}: {str(upload_error)}")
+                    # Don't re-raise - continue with cleanup
+            else:
+                logger.error(f"❌ Failed to create {camera_name} timelapse video")
+                
+        except Exception as e:
+            logger.error(f"❌ {camera_name} processing failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        
+        # Final summary
         logger.info("=" * 50)
-        logger.info("=== TIMELAPSE CREATION COMPLETED ===")
+        logger.info(f"=== {domain_name.upper()}/{camera_name.upper()} TIMELAPSE CREATION COMPLETED ===")
+        if ENABLE_IMAGE_SYNC and SYNC_BEFORE_VIDEO and sync_result:
+            logger.info(f"📊 Final image count in local storage: {sync_result['count']}")
+            logger.info(f"📁 Local storage size: {sync_result['size'] / (1024*1024):.2f} MB")
+        logger.info(f"📂 Local storage path: {LOCAL_IMAGE_FOLDER}/{domain_name}/{camera_name}/")
         logger.info("=" * 50)
         
     except Exception as e:
