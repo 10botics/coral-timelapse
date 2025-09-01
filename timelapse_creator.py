@@ -911,7 +911,18 @@ def main():
                 
                 # Check if this domain/camera combination has images locally
                 local_images = get_images_from_local_storage_by_domain_camera(domain_name, camera_name)
-                
+
+                # Minimal fix: if no local images, run synchronization first, then re-check
+                if not local_images and ENABLE_IMAGE_SYNC and SYNC_BEFORE_VIDEO:
+                    logger.info("  🔄 No local images; running image synchronization before deciding...")
+                    try:
+                        image_folder_id = find_or_create_folder(service, camera['id'], IMAGE_FOLDER_NAME)
+                        _sync_result = synchronize_images(service, image_folder_id, domain_name, camera_name)
+                    except Exception as _sync_err:
+                        logger.warning(f"  ⚠️ Sync attempt failed for {domain_name}/{camera_name}: {_sync_err}")
+                    # Re-check local images after sync attempt
+                    local_images = get_images_from_local_storage_by_domain_camera(domain_name, camera_name)
+
                 if local_images:
                     domain_camera_pairs.append({
                         'domain': domain_name,
@@ -920,9 +931,9 @@ def main():
                         'local_images': local_images,
                         'image_count': len(local_images)
                     })
-                    logger.info(f"  ✅ {domain_name}/{camera_name}: {len(local_images)} images available locally")
+                    logger.info(f"  ✅ {domain_name}/{camera_name}: {len(local_images)} images available locally (post-check)")
                 else:
-                    logger.info(f"  ⏭️ {domain_name}/{camera_name}: No local images (skipping)")
+                    logger.info(f"  ⏭️ {domain_name}/{camera_name}: No local images after sync (skipping)")
         
         if not domain_camera_pairs:
             logger.error("❌ No domain/camera combinations found with local images")
