@@ -12,9 +12,18 @@ import tempfile
 import shutil
 from dotenv import load_dotenv
 import time
+import threading
+import signal
+import sys
 
 # Load environment variables from .env file
 load_dotenv()
+
+# SAFETY CONFIGURATION - Prevent infinite loops and hanging
+MAX_EXECUTION_TIME = 1800  # 30 minutes maximum execution time
+PROGRESS_LOG_INTERVAL = 30  # Log progress every 30 seconds
+MAX_RETRIES = 3  # Maximum retries for API calls
+API_TIMEOUT = 60  # 60 seconds timeout for API calls
 
 def get_storage_base_path():
     """Determine the base storage path based on environment"""
@@ -39,9 +48,10 @@ TEMP_DIR = '/home/ubuntu/coral-timelapse/persistence_storage/temp' if os.path.ex
 LOCAL_IMAGE_FOLDER = get_storage_base_path()
 
 # Maximum images per timelapse video (24 fps)
-#MAX_IMAGES_PER_VIDEO = 21840   # 21,840 images = ~15.2 minutes at 24 FPS
-#MAX_IMAGES_PER_VIDEO = 21000   # 21,000 images = ~14.6 minutes at 24 FPS
-MAX_IMAGES_PER_VIDEO = 1000     # 1,000 images = ~42 seconds at 24 FPS (for 10-minute total runtime)   
+MAX_IMAGES_PER_VIDEO = 1000     # 1,000 images = ~42 seconds at 24 FPS (for video processing)
+
+# Maximum images to download and keep locally (separate from processing limit)
+MAX_IMAGES_DOWNLOAD = 21840     # 21,840 images = ~15.2 minutes at 24 FPS (for local storage)   
 
 # Image synchronization settings
 ENABLE_IMAGE_SYNC = os.getenv('ENABLE_IMAGE_SYNC', 'true').lower() == 'true'
@@ -58,40 +68,106 @@ MAX_GOOGLE_DRIVE_IMAGES = int(os.getenv('MAX_GOOGLE_DRIVE_IMAGES', '100'))
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Global variables for timeout and progress monitoring
+script_start_time = None
+progress_timer = None
+timeout_timer = None
+
+def setup_global_timeout():
+    """Set up global timeout mechanism to prevent infinite loops"""
+    global script_start_time, timeout_timer
+    
+    script_start_time = time.time()
+    
+    def timeout_handler():
+        elapsed_time = time.time() - script_start_time
+        logger.error(f"⏰ GLOBAL TIMEOUT REACHED: {elapsed_time:.1f} seconds")
+        logger.error("🚨 Script has been running too long - forcing exit to prevent infinite loop")
+        logger.error("💡 This indicates a hanging process in the script")
+        os._exit(1)
+    
+    timeout_timer = threading.Timer(MAX_EXECUTION_TIME, timeout_handler)
+    timeout_timer.start()
+    logger.info(f"⏰ Global timeout set: {MAX_EXECUTION_TIME} seconds")
+
+def setup_progress_monitoring():
+    """Set up progress monitoring to log status every 30 seconds"""
+    global progress_timer
+    
+    def progress_logger():
+        elapsed_time = time.time() - script_start_time
+        logger.info(f"📊 PROGRESS: Script running for {elapsed_time:.1f} seconds")
+        logger.info(f"📊 PROGRESS: Still processing... (max time: {MAX_EXECUTION_TIME}s)")
+        
+        # Restart the timer
+        progress_timer = threading.Timer(PROGRESS_LOG_INTERVAL, progress_logger)
+        progress_timer.start()
+    
+    progress_timer = threading.Timer(PROGRESS_LOG_INTERVAL, progress_logger)
+    progress_timer.start()
+    logger.info(f"📊 Progress monitoring started: logging every {PROGRESS_LOG_INTERVAL} seconds")
+
+def cleanup_timers():
+    """Clean up all timers"""
+    global progress_timer, timeout_timer
+    
+    if progress_timer:
+        progress_timer.cancel()
+        logger.info("📊 Progress monitoring stopped")
+    
+    if timeout_timer:
+        timeout_timer.cancel()
+        logger.info("⏰ Global timeout cancelled")
+
 def authenticate():
-    """Authenticate with Google Drive API with retry logic"""
-    max_retries = 3
-    for attempt in range(max_retries):
+    """Authenticate with Google Drive API with timeout and retry logic"""
+    logger.info("🔐 Starting Google Drive authentication...")
+    
+    for attempt in range(MAX_RETRIES):
         try:
-            logger.info(f"Authenticating using service account... (attempt {attempt + 1}/{max_retries})")
+            logger.info(f"🔐 Authentication attempt {attempt + 1}/{MAX_RETRIES}")
+            
+            # Set up timeout for authentication
+            auth_start_time = time.time()
+            
             credentials = service_account.Credentials.from_service_account_file(
                 SERVICE_ACCOUNT_FILE, scopes=SCOPES)
             service = build('drive', 'v3', credentials=credentials)
             
-            # Test the connection
+            # Test the connection with timeout
+            logger.info("🔐 Testing Google Drive API connection...")
+            test_start_time = time.time()
+            
             try:
+                # Use a simple API call to test connection
                 service.files().list(pageSize=1).execute()
-                logger.info("✅ Google Drive API connection successful")
+                test_duration = time.time() - test_start_time
+                logger.info(f"✅ Google Drive API connection successful ({test_duration:.2f}s)")
                 return service
+                
             except Exception as test_error:
-                logger.warning(f"Initial API test failed: {test_error}")
-                if attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) + 1
-                    logger.info(f"Retrying authentication in {wait_time} seconds...")
+                test_duration = time.time() - test_start_time
+                logger.warning(f"⚠️ API test failed after {test_duration:.2f}s: {test_error}")
+                
+                if attempt < MAX_RETRIES - 1:
+                    wait_time = min(10, (2 ** attempt) + 1)  # Cap wait time at 10 seconds
+                    logger.info(f"🔄 Retrying authentication in {wait_time} seconds...")
                     time.sleep(wait_time)
                     continue
                 else:
                     raise test_error
                     
         except Exception as e:
-            if attempt < max_retries - 1:
-                wait_time = (2 ** attempt) + 1
-                logger.warning(f"Authentication attempt {attempt + 1} failed: {str(e)}")
-                logger.info(f"Retrying in {wait_time} seconds...")
+            auth_duration = time.time() - auth_start_time
+            logger.warning(f"⚠️ Authentication attempt {attempt + 1} failed after {auth_duration:.2f}s: {str(e)}")
+            
+            if attempt < MAX_RETRIES - 1:
+                wait_time = min(10, (2 ** attempt) + 1)  # Cap wait time at 10 seconds
+                logger.info(f"🔄 Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
                 continue
             else:
-                logger.error(f"Authentication failed after {max_retries} attempts: {str(e)}")
+                logger.error(f"❌ Authentication failed after {MAX_RETRIES} attempts: {str(e)}")
                 raise
 
 def verify_folder_access(service, folder_id):
@@ -214,11 +290,11 @@ def get_all_images_from_folder(domain_name=None, camera_name=None):
     try:
         if domain_name and camera_name:
             # Specific domain and camera
-            local_image_folder = os.path.join(os.getcwd(), LOCAL_IMAGE_FOLDER, domain_name, camera_name)
+            local_image_folder = os.path.join(LOCAL_IMAGE_FOLDER, domain_name, camera_name)
             logger.info(f"📁 Looking for images in: {local_image_folder}")
         else:
             # Default to old behavior (backward compatibility)
-            local_image_folder = os.path.join(os.getcwd(), LOCAL_IMAGE_FOLDER)
+            local_image_folder = LOCAL_IMAGE_FOLDER
             logger.info(f"📁 Looking for images in: {local_image_folder}")
         
         if not os.path.exists(local_image_folder):
@@ -271,15 +347,22 @@ def get_images_from_local_storage_by_domain_camera(domain_name, camera_name):
         return []
 
 def get_google_drive_images(service, image_folder_id):
-    """Get list of images from Google Drive image folder"""
+    """Get list of images from Google Drive image folder with timeout and progress logging"""
     try:
         logger.info(f"🔍 Fetching images from Google Drive folder ID: {image_folder_id}")
         
         images = []
         page_token = None
+        page_count = 0
+        max_pages = 50  # Safety limit to prevent infinite pagination
         
-        while True:
+        while page_count < max_pages:
             try:
+                page_start_time = time.time()
+                page_count += 1
+                
+                logger.info(f"🔍 Fetching page {page_count} of Google Drive images...")
+                
                 # Use the same query format as the original working script
                 query = f"'{image_folder_id}' in parents and (mimeType='image/jpeg' or mimeType='image/png' or mimeType='image/jpg') and trashed=false"
                 logger.debug(f"🔍 Google Drive query: {query}")
@@ -302,15 +385,23 @@ def get_google_drive_images(service, image_folder_id):
                         'size': int(file.get('size', 0))
                     })
                 
+                page_duration = time.time() - page_start_time
+                logger.info(f"📊 Page {page_count}: {len(files)} images fetched in {page_duration:.2f}s (total: {len(images)})")
+                
                 page_token = results.get('nextPageToken')
                 if not page_token:
+                    logger.info("📊 No more pages - pagination complete")
                     break
                     
             except Exception as e:
-                logger.error(f"Error fetching Google Drive images: {str(e)}")
+                page_duration = time.time() - page_start_time
+                logger.error(f"❌ Error fetching page {page_count} after {page_duration:.2f}s: {str(e)}")
                 break
         
-        logger.info(f"📊 Found {len(images)} images in Google Drive")
+        if page_count >= max_pages:
+            logger.warning(f"⚠️ Reached maximum page limit ({max_pages}) - stopping pagination")
+        
+        logger.info(f"📊 Google Drive image fetch complete: {len(images)} images found in {page_count} pages")
         return images
         
     except Exception as e:
@@ -320,7 +411,7 @@ def get_google_drive_images(service, image_folder_id):
 def get_local_storage_info_by_domain_camera(domain_name, camera_name):
     """Get information about images in local storage for specific domain/camera"""
     try:
-        local_image_folder = os.path.join(os.getcwd(), LOCAL_IMAGE_FOLDER, domain_name, camera_name)
+        local_image_folder = os.path.join(LOCAL_IMAGE_FOLDER, domain_name, camera_name)
         
         if not os.path.exists(local_image_folder):
             logger.warning(f"Local image folder not found: {local_image_folder}")
@@ -409,8 +500,8 @@ def download_new_images(service, new_images, local_image_folder):
                 
             except Exception as e:
                 logger.error(f"❌ Failed to download {image['name']}: {str(e)}")
-                continue
-        
+            continue
+
         logger.info(f"📥 Download complete: {downloaded_count}/{len(new_images)} images downloaded")
         return downloaded_count
         
@@ -484,7 +575,7 @@ def cleanup_google_drive_overflow(service, image_folder_id, max_images):
             except Exception as delete_error:
                 logger.error(f"❌ Failed to delete {image['name']}: {str(delete_error)}")
                 continue
-        
+
         logger.info(f"🧹 Google Drive overflow cleanup complete: removed {removed_count} oldest images")
         logger.info(f"📊 Remaining images in Google Drive: {total_images - removed_count}")
         
@@ -551,7 +642,8 @@ def synchronize_images(service, image_folder_id, domain_name, camera_name):
     try:
         logger.info("🔄 Starting image synchronization process...")
         logger.info(f"🎯 Target: Keep local storage synchronized with Google Drive")
-        logger.info(f"📏 Maximum images allowed: {MAX_IMAGES_PER_VIDEO}")
+        logger.info(f"📏 Maximum images to download: {MAX_IMAGES_DOWNLOAD}")
+        logger.info(f"🎬 Maximum images for video processing: {MAX_IMAGES_PER_VIDEO}")
         logger.info(f"📂 Domain/Camera: {domain_name}/{camera_name}")
         
         # Step 1: CAPTURE SNAPSHOT of current state (don't re-count during process)
@@ -576,67 +668,91 @@ def synchronize_images(service, image_folder_id, domain_name, camera_name):
         logger.info("🔍 Step 2: Identifying new images using snapshot...")
         new_images = identify_new_images(google_drive_images, local_storage_info)
         
-        # Step 3: Download new images FIRST (don't delete anything yet)
+        # Step 3: Download only what's needed for processing (limit to MAX_IMAGES_PER_VIDEO)
         if new_images:
-            logger.info(f"📥 Step 3: Downloading {len(new_images)} new images FIRST...")
+            # Calculate how many images we need to download to reach processing limit
+            current_local_count = initial_local_count
+            images_needed_for_processing = MAX_IMAGES_PER_VIDEO - current_local_count
             
-            # Create the full domain/camera path for downloads
-            local_image_folder = os.path.join(os.getcwd(), LOCAL_IMAGE_FOLDER, domain_name, camera_name)
-            
-            # Ensure local folder exists (create domain and camera subfolders)
-            os.makedirs(local_image_folder, exist_ok=True)
-            logger.info(f"📁 Downloading images to: {local_image_folder}")
-            
-            downloaded_count = download_new_images(service, new_images, local_image_folder)
-            
-            if downloaded_count > 0:
-                logger.info(f"✅ Downloaded {downloaded_count} new images successfully")
+            if images_needed_for_processing > 0:
+                # Limit downloads to only what's needed for processing
+                images_to_download = min(len(new_images), images_needed_for_processing)
+                limited_new_images = new_images[:images_to_download]
+                
+                logger.info(f"📥 Step 3: Downloading {images_to_download} images (needed for processing)...")
+                logger.info(f"🎯 Processing target: {MAX_IMAGES_PER_VIDEO} images")
+                logger.info(f"📊 Current local: {current_local_count}, Need: {images_needed_for_processing}")
+                logger.info(f"📥 Available new: {len(new_images)}, Will download: {images_to_download}")
+                
+                # Create the full domain/camera path for downloads
+                local_image_folder = os.path.join(LOCAL_IMAGE_FOLDER, domain_name, camera_name)
+                
+                # Ensure local folder exists (create domain and camera subfolders)
+                os.makedirs(local_image_folder, exist_ok=True)
+                logger.info(f"📁 Downloading images to: {local_image_folder}")
+                
+                downloaded_count = download_new_images(service, limited_new_images, local_image_folder)
+                
+                if downloaded_count > 0:
+                    logger.info(f"✅ Downloaded {downloaded_count} images for processing")
+                else:
+                    logger.warning(f"⚠️ No images were downloaded")
             else:
-                logger.warning(f"⚠️ No images were downloaded")
+                logger.info(f"✅ Already have {current_local_count} images, no downloads needed for processing")
+                downloaded_count = 0
         else:
             logger.info("✅ No new images to download")
+            downloaded_count = 0
         
-        # Step 4: Calculate total using snapshot + downloads (consistent calculation)
-        logger.info("📊 Step 4: Calculating total using snapshot + downloads...")
-        total_after_download = initial_local_count + len(new_images)
+        # Step 4: Calculate total using snapshot + actual downloads
+        logger.info("📊 Step 4: Calculating total using snapshot + actual downloads...")
+        total_after_download = initial_local_count + downloaded_count
         
         logger.info(f"📊 Post-download analysis (using snapshot):")
         logger.info(f"   • Initial local count: {initial_local_count}")
-        logger.info(f"   • New images downloaded: {len(new_images)}")
+        logger.info(f"   • Images downloaded: {downloaded_count}")
         logger.info(f"   • Total after download: {total_after_download}")
-        logger.info(f"   • Maximum allowed: {MAX_IMAGES_PER_VIDEO}")
-        logger.info(f"   • Overflow: {max(0, total_after_download - MAX_IMAGES_PER_VIDEO)} images")
+        logger.info(f"   • Download limit: {MAX_IMAGES_DOWNLOAD}")
+        logger.info(f"   • Processing limit: {MAX_IMAGES_PER_VIDEO}")
+        logger.info(f"   • Download overflow: {max(0, total_after_download - MAX_IMAGES_DOWNLOAD)} images")
         
-        # Step 5: Clean up local storage overflow using snapshot-based calculation
-        if total_after_download > MAX_IMAGES_PER_VIDEO:
-            logger.info(f"🧹 Step 5: Cleaning up local storage overflow using snapshot...")
-            local_overflow = total_after_download - MAX_IMAGES_PER_VIDEO
+        # Step 5: Clean up local storage ONLY if it exceeds download limit
+        if total_after_download > MAX_IMAGES_DOWNLOAD:
+            logger.info(f"🧹 Step 5: Cleaning up local storage overflow (exceeds download limit)...")
+            local_overflow = total_after_download - MAX_IMAGES_DOWNLOAD
             logger.info(f"📁 Need to remove {local_overflow} overflow images from local storage")
+            logger.info(f"📏 Download limit: {MAX_IMAGES_DOWNLOAD}, Processing limit: {MAX_IMAGES_PER_VIDEO}")
+            logger.info(f"🎯 Only removing images because local storage exceeds download limit")
             
-            # Use the snapshot-based local storage info for cleanup
-            removed_count = cleanup_old_images(local_storage_info, MAX_IMAGES_PER_VIDEO)
+            # Use the snapshot-based local storage info for cleanup with download limit
+            removed_count = cleanup_old_images(local_storage_info, MAX_IMAGES_DOWNLOAD)
             logger.info(f"✅ Local storage cleanup: removed {removed_count} overflow images")
         else:
-            logger.info(f"✅ Local storage within limit: {total_after_download} images")
+            logger.info(f"✅ Local storage within download limit: {total_after_download} images")
+            logger.info(f"📏 Download limit: {MAX_IMAGES_DOWNLOAD}, Processing limit: {MAX_IMAGES_PER_VIDEO}")
+            logger.info(f"🎯 No cleanup needed - local storage is within download limit")
             local_overflow = 0
         
-        # Step 6: Clean up Google Drive overflow using snapshot (consistent with local logic)
-        logger.info("🧹 Step 6: Cleaning up Google Drive overflow using snapshot...")
+        # Step 6: Clean up Google Drive ONLY if it exceeds download limit
+        logger.info("🧹 Step 6: Cleaning up Google Drive overflow (only if exceeds download limit)...")
         total_gd_images = initial_gd_count  # Use snapshot count
         
         logger.info(f"☁️ Google Drive analysis (using snapshot):")
         logger.info(f"   • Total images: {total_gd_images}")
-        logger.info(f"   • Maximum allowed: {MAX_IMAGES_PER_VIDEO}")
-        logger.info(f"   • Overflow: {max(0, total_gd_images - MAX_IMAGES_PER_VIDEO)} images")
+        logger.info(f"   • Download limit: {MAX_IMAGES_DOWNLOAD}")
+        logger.info(f"   • Processing limit: {MAX_IMAGES_PER_VIDEO}")
+        logger.info(f"   • Overflow: {max(0, total_gd_images - MAX_IMAGES_DOWNLOAD)} images")
         
-        if total_gd_images > MAX_IMAGES_PER_VIDEO:
-            gd_overflow = total_gd_images - MAX_IMAGES_PER_VIDEO
+        if total_gd_images > MAX_IMAGES_DOWNLOAD:
+            gd_overflow = total_gd_images - MAX_IMAGES_DOWNLOAD
             logger.info(f"☁️ Need to remove {gd_overflow} overflow images from Google Drive")
+            logger.info(f"🎯 Only removing images because Google Drive exceeds download limit")
             
-            gd_removed = cleanup_google_drive_overflow(service, image_folder_id, MAX_IMAGES_PER_VIDEO)
+            gd_removed = cleanup_google_drive_overflow(service, image_folder_id, MAX_IMAGES_DOWNLOAD)
             logger.info(f"✅ Google Drive cleanup: removed {gd_removed} overflow images")
         else:
-            logger.info(f"✅ Google Drive within limit: {total_gd_images} images")
+            logger.info(f"✅ Google Drive within download limit: {total_gd_images} images")
+            logger.info(f"🎯 No cleanup needed - Google Drive is within download limit")
             gd_removed = 0
         
         # Step 7: Final summary using snapshot-based results
@@ -645,7 +761,8 @@ def synchronize_images(service, image_folder_id, domain_name, camera_name):
         logger.info(f"📊 Final results (based on snapshot):")
         logger.info(f"   • Google Drive: {total_gd_images} images (snapshot)")
         logger.info(f"   • Local storage: {total_after_download} images (calculated)")
-        logger.info(f"   • Target limit: {MAX_IMAGES_PER_VIDEO}")
+        logger.info(f"   • Download limit: {MAX_IMAGES_DOWNLOAD}")
+        logger.info(f"   • Processing limit: {MAX_IMAGES_PER_VIDEO}")
         logger.info(f"🆕 New images downloaded: {len(new_images)}")
         logger.info(f"🧹 Overflow cleanup results:")
         logger.info(f"   • Local storage: {local_overflow} images removed")
@@ -690,9 +807,13 @@ def create_video(image_paths, output_video, desired_duration):
         # Calculate actual duration based on fixed FPS
         actual_duration = num_images / fps
         
-        logger.info(f"Starting video creation process...")
-        logger.info(f"Video specifications: {num_images} images at fixed {fps} fps")
-        logger.info(f"Expected duration: {actual_duration:.2f} seconds")
+        logger.info(f"🎬 Starting video creation process...")
+        logger.info(f"🎬 Video specifications: {num_images} images at fixed {fps} fps")
+        logger.info(f"🎬 Expected duration: {actual_duration:.2f} seconds")
+        
+        # Set up timeout for video creation (based on number of images)
+        video_timeout = max(300, num_images * 0.1)  # At least 5 minutes, or 0.1s per image
+        logger.info(f"⏰ Video creation timeout: {video_timeout:.1f} seconds")
         
         # Create a text file listing all images for ffmpeg
         logger.info("Creating image list file for FFmpeg...")
@@ -722,8 +843,8 @@ def create_video(image_paths, output_video, desired_duration):
             output_video
         ]
         
-        # Run FFmpeg with real-time output capture
-        logger.info("Video encoding in progress...")
+        # Run FFmpeg with real-time output capture and timeout
+        logger.info("🎬 Starting FFmpeg video encoding...")
         process = subprocess.Popen(
             cmd, 
             stdout=subprocess.PIPE, 
@@ -732,6 +853,20 @@ def create_video(image_paths, output_video, desired_duration):
             bufsize=1,
             universal_newlines=True
         )
+        
+        # Set up timeout for FFmpeg process
+        def kill_ffmpeg():
+            if process.poll() is None:  # Process still running
+                logger.error(f"⏰ FFmpeg timeout reached ({video_timeout:.1f}s) - killing process")
+                process.terminate()
+                time.sleep(5)
+                if process.poll() is None:
+                    logger.error("🚨 FFmpeg process still running - force killing")
+                    process.kill()
+        
+        ffmpeg_timer = threading.Timer(video_timeout, kill_ffmpeg)
+        ffmpeg_timer.start()
+        logger.info(f"⏰ FFmpeg timeout set: {video_timeout:.1f} seconds")
         
         # Monitor FFmpeg progress with image processing details
         start_time = time.time()
@@ -771,6 +906,10 @@ def create_video(image_paths, output_video, desired_duration):
         # Wait for completion and get return code
         return_code = process.poll()
         
+        # Cancel the timeout timer
+        ffmpeg_timer.cancel()
+        logger.info("⏰ FFmpeg timeout timer cancelled")
+        
         if return_code == 0:
             # Check if output file was created and has size
             if os.path.exists(output_video) and os.path.getsize(output_video) > 0:
@@ -795,13 +934,13 @@ def create_video(image_paths, output_video, desired_duration):
         return False
 
 def upload_video(service, folder_id, video_path, video_name):
-    """Upload video with retry logic using the original working method"""
-    max_retries = 3
-    base_delay = 2
+    """Upload video with timeout and retry logic"""
+    logger.info(f"📤 Starting video upload: {video_name}")
     
-    for attempt in range(max_retries):
+    for attempt in range(MAX_RETRIES):
         try:
-            logger.info(f"📤 Upload attempt {attempt + 1}/{max_retries} for video: {video_name}")
+            upload_start_time = time.time()
+            logger.info(f"📤 Upload attempt {attempt + 1}/{MAX_RETRIES} for video: {video_name}")
             
             # Check file exists and get size
             if not os.path.exists(video_path):
@@ -811,6 +950,10 @@ def upload_video(service, folder_id, video_path, video_name):
             file_size_mb = file_size / (1024 * 1024)
             logger.info(f"📁 File size: {file_size_mb:.2f} MB")
             
+            # Calculate upload timeout based on file size (1MB per second minimum)
+            upload_timeout = max(300, file_size_mb)  # At least 5 minutes, or 1s per MB
+            logger.info(f"⏰ Upload timeout: {upload_timeout:.1f} seconds")
+            
             # Use the original working upload method
             file_metadata = {'name': video_name, 'parents': [folder_id]}
             media = MediaFileUpload(video_path, mimetype='video/mp4')
@@ -818,36 +961,55 @@ def upload_video(service, folder_id, video_path, video_name):
             logger.info(f"🚀 Starting upload to folder ID: {folder_id}")
             logger.info(f"📤 Uploading {file_size_mb:.2f} MB to Google Drive...")
             
-            # Execute upload using the original method (this is what was working!)
-            response = service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id',
-                supportsAllDrives=True
-            ).execute()
+            # Set up upload timeout
+            def upload_timeout_handler():
+                logger.error(f"⏰ Upload timeout reached ({upload_timeout:.1f}s)")
+                logger.error("🚨 Upload process is taking too long - this may indicate a hanging upload")
             
-            logger.info(f"📡 Upload completed, processing response...")
+            upload_timer = threading.Timer(upload_timeout, upload_timeout_handler)
+            upload_timer.start()
             
-            if response and 'id' in response:
-                logger.info(f"✅ Upload successful! File ID: {response['id']}")
-                logger.info(f"📊 Uploaded size: {file_size_mb:.2f} MB")
-                return True
-            else:
-                raise Exception("Upload completed but no file ID returned")
+            try:
+                # Execute upload using the original method
+                response = service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields='id',
+                    supportsAllDrives=True
+                ).execute()
+                
+                upload_duration = time.time() - upload_start_time
+                upload_timer.cancel()
+                
+                logger.info(f"📡 Upload completed in {upload_duration:.2f}s, processing response...")
+                
+                if response and 'id' in response:
+                    logger.info(f"✅ Upload successful! File ID: {response['id']}")
+                    logger.info(f"📊 Uploaded {file_size_mb:.2f} MB in {upload_duration:.2f}s")
+                    logger.info(f"⚡ Upload speed: {file_size_mb/upload_duration:.2f} MB/s")
+                    return True
+                else:
+                    raise Exception("Upload completed but no file ID returned")
+                    
+            except Exception as upload_error:
+                upload_timer.cancel()
+                upload_duration = time.time() - upload_start_time
+                raise upload_error
                 
         except Exception as e:
             error_msg = str(e)
-            logger.warning(f"⚠️ Upload attempt {attempt + 1} failed: {error_msg}")
+            upload_duration = time.time() - upload_start_time
+            logger.warning(f"⚠️ Upload attempt {attempt + 1} failed after {upload_duration:.2f}s: {error_msg}")
             
             # Check if it's a retryable error
             if any(keyword in error_msg.lower() for keyword in ['ssl', 'eof', 'protocol', 'connection', 'timeout']):
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)  # Exponential backoff
-                    logger.info(f"🔄 Retrying in {delay} seconds... (SSL/Network error)")
+                if attempt < MAX_RETRIES - 1:
+                    delay = min(30, 2 ** attempt)  # Cap delay at 30 seconds
+                    logger.info(f"🔄 Retrying in {delay} seconds... (Network error)")
                     time.sleep(delay)
                     continue
                 else:
-                    logger.error(f"❌ All upload attempts failed due to SSL/Network issues")
+                    logger.error(f"❌ All upload attempts failed due to network issues")
                     raise
             else:
                 # Non-retryable error
@@ -855,12 +1017,18 @@ def upload_video(service, folder_id, video_path, video_name):
                 raise
     
     # If we get here, all retries failed
-    raise Exception(f"Upload failed after {max_retries} attempts")
+    raise Exception(f"Upload failed after {MAX_RETRIES} attempts")
 
 
 
 def main():
     logger.info("===== Google Drive Timelapse Creator (Domain/Camera Structure Mode) =====")
+    logger.info("🚀 Starting timelapse creation with safety mechanisms...")
+    
+    # Set up global timeout and progress monitoring
+    setup_global_timeout()
+    setup_progress_monitoring()
+    
     try:
         # Check if root folder ID is configured
         if not FOLDER_A_ID:
@@ -877,11 +1045,12 @@ def main():
         hkt = pytz.timezone('Asia/Hong_Kong')
         now = datetime.now(hkt)
         logger.info(f"Current time (HKT): {now}")
-        
+
         logger.info("=== DOMAIN/CAMERA TIMELAPSE CREATION STARTED ===")
         logger.info(f"Root Folder ID: {FOLDER_A_ID}")
         logger.info(f"Local image folder: {LOCAL_IMAGE_FOLDER}")
         logger.info(f"Maximum images per video: {MAX_IMAGES_PER_VIDEO}")
+        logger.info(f"Maximum images to download: {MAX_IMAGES_DOWNLOAD}")
         logger.info(f"Target FPS: 24")
         logger.info(f"Image synchronization: {'Enabled' if ENABLE_IMAGE_SYNC else 'Disabled'}")
         logger.info(f"Sync before video creation: {'Yes' if SYNC_BEFORE_VIDEO else 'No'}")
@@ -1020,7 +1189,7 @@ def main():
                     logger.info(f"📁 Video uploaded to: {domain_name}/{camera_name}/timelapse/ folder in Google Drive")
                     logger.info(f"🎯 Final location: {domain_name}/{camera_name}/timelapse/{video_name}")
                     
-                    # Step 5: Comprehensive overflow cleanup (ensure both locations stay within MAX_IMAGES_PER_VIDEO limit)
+                    # Step 5: Comprehensive overflow cleanup (ensure both locations stay within MAX_IMAGES_DOWNLOAD limit)
                     logger.info("🧹 Step 5: Comprehensive overflow cleanup after video creation...")
                     try:
                         image_folder_id = find_or_create_folder(service, camera_folder['id'], IMAGE_FOLDER_NAME)
@@ -1029,7 +1198,7 @@ def main():
                             image_folder_id, 
                             domain_name, 
                             camera_name, 
-                            MAX_IMAGES_PER_VIDEO
+                            MAX_IMAGES_DOWNLOAD
                         )
                         logger.info(f"✅ Overflow cleanup completed:")
                         logger.info(f"   • Local storage: {overflow_cleanup_result['local_removed']} images removed")
@@ -1067,8 +1236,16 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
+        # Clean up timers and temporary files
+        cleanup_timers()
         logger.info("Cleaning up temporary directory...")
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
+        
+        # Log final execution time
+        if script_start_time:
+            total_time = time.time() - script_start_time
+            logger.info(f"📊 Total execution time: {total_time:.2f} seconds")
+            logger.info(f"📊 Script completed successfully in {total_time:.2f} seconds")
 
 if __name__ == '__main__':
     main()
