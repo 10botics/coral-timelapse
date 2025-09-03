@@ -89,9 +89,10 @@ def setup_global_timeout():
     timeout_timer = threading.Timer(MAX_EXECUTION_TIME, timeout_handler)
     timeout_timer.start()
     logger.info(f"⏰ Global timeout set: {MAX_EXECUTION_TIME} seconds")
+    logger.info(f"⏰ Script will be killed at: {datetime.now() + timedelta(seconds=MAX_EXECUTION_TIME)}")
 
 def reset_global_timeout(activity_description="processing"):
-    """Reset/extend the global timeout when script is actively working"""
+    """Extend the global timeout when script is actively working"""
     global timeout_timer, script_start_time
     
     if timeout_timer:
@@ -101,7 +102,10 @@ def reset_global_timeout(activity_description="processing"):
         # Calculate elapsed time
         elapsed_time = time.time() - script_start_time
         
-        # Set up a new timeout (extend by another MAX_EXECUTION_TIME)
+        # Calculate remaining time and extend by MAX_EXECUTION_TIME
+        remaining_time = max(0, MAX_EXECUTION_TIME - elapsed_time)
+        new_timeout = remaining_time + MAX_EXECUTION_TIME  # EXTEND, don't reset
+        
         def timeout_handler():
             total_elapsed = time.time() - script_start_time
             logger.error(f"⏰ GLOBAL TIMEOUT REACHED: {total_elapsed:.1f} seconds")
@@ -109,10 +113,10 @@ def reset_global_timeout(activity_description="processing"):
             logger.error("💡 This indicates a hanging process in the script")
             os._exit(1)
         
-        timeout_timer = threading.Timer(MAX_EXECUTION_TIME, timeout_handler)
+        timeout_timer = threading.Timer(new_timeout, timeout_handler)
         timeout_timer.start()
         
-        logger.info(f"⏰ Global timeout reset/extended: {activity_description} (elapsed: {elapsed_time:.1f}s, new timeout: {MAX_EXECUTION_TIME}s)")
+        logger.info(f"⏰ Global timeout extended: {activity_description} (elapsed: {elapsed_time:.1f}s, new timeout: {new_timeout:.1f}s)")
     else:
         logger.warning("⚠️ Cannot reset timeout - timer not initialized")
 
@@ -122,8 +126,9 @@ def setup_progress_monitoring():
     
     def progress_logger():
         elapsed_time = time.time() - script_start_time
+        remaining_time = max(0, MAX_EXECUTION_TIME - elapsed_time)
         logger.info(f"📊 PROGRESS: Script running for {elapsed_time:.1f} seconds")
-        logger.info(f"📊 PROGRESS: Still processing... (max time: {MAX_EXECUTION_TIME}s)")
+        logger.info(f"📊 PROGRESS: Still processing... (elapsed: {elapsed_time:.1f}s, remaining: {remaining_time:.1f}s)")
         
         # Restart the timer
         progress_timer = threading.Timer(PROGRESS_LOG_INTERVAL, progress_logger)
