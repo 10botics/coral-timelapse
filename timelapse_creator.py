@@ -48,7 +48,7 @@ TEMP_DIR = '/home/ubuntu/coral-timelapse/persistence_storage/temp' if os.path.ex
 LOCAL_IMAGE_FOLDER = get_storage_base_path()
 
 # Maximum images per timelapse video (24 fps)
-MAX_IMAGES_PER_VIDEO = 1000     # 1,000 images = ~42 seconds at 24 FPS (for video processing)
+MAX_IMAGES_PER_VIDEO = 500    # number of images to download from google drive and to process
 
 # Maximum images to download and keep locally (separate from processing limit)
 MAX_IMAGES_DOWNLOAD = 21840     # 21,840 images = ~15.2 minutes at 24 FPS (for local storage)   
@@ -89,6 +89,32 @@ def setup_global_timeout():
     timeout_timer = threading.Timer(MAX_EXECUTION_TIME, timeout_handler)
     timeout_timer.start()
     logger.info(f"⏰ Global timeout set: {MAX_EXECUTION_TIME} seconds")
+
+def reset_global_timeout(activity_description="processing"):
+    """Reset/extend the global timeout when script is actively working"""
+    global timeout_timer, script_start_time
+    
+    if timeout_timer:
+        # Cancel the current timeout
+        timeout_timer.cancel()
+        
+        # Calculate elapsed time
+        elapsed_time = time.time() - script_start_time
+        
+        # Set up a new timeout (extend by another MAX_EXECUTION_TIME)
+        def timeout_handler():
+            total_elapsed = time.time() - script_start_time
+            logger.error(f"⏰ GLOBAL TIMEOUT REACHED: {total_elapsed:.1f} seconds")
+            logger.error("🚨 Script has been running too long - forcing exit to prevent infinite loop")
+            logger.error("💡 This indicates a hanging process in the script")
+            os._exit(1)
+        
+        timeout_timer = threading.Timer(MAX_EXECUTION_TIME, timeout_handler)
+        timeout_timer.start()
+        
+        logger.info(f"⏰ Global timeout reset/extended: {activity_description} (elapsed: {elapsed_time:.1f}s, new timeout: {MAX_EXECUTION_TIME}s)")
+    else:
+        logger.warning("⚠️ Cannot reset timeout - timer not initialized")
 
 def setup_progress_monitoring():
     """Set up progress monitoring to log status every 30 seconds"""
@@ -1111,125 +1137,141 @@ def main():
         
         logger.info(f"📊 Found {len(domain_camera_pairs)} domain/camera combinations with local images")
         
-        # For now, process the first available domain/camera (maintains current behavior)
-        # In the future, this will loop through all combinations
-        selected_pair = domain_camera_pairs[0]
-        domain_name = selected_pair['domain']
-        camera_name = selected_pair['camera']
-        camera_folder = {'id': selected_pair['folder_id'], 'name': camera_name}
+        # Process ALL domain/camera combinations (both Cam1 and Cam2)
+        logger.info(f"🎯 Processing ALL {len(domain_camera_pairs)} domain/camera combinations...")
         
-        logger.info(f"🎯 Processing: {domain_name}/{camera_name} ({selected_pair['image_count']} images)")
-        
-        # Get or create the timelapse folder directly under the camera
-        logger.info(f"📁 Looking for timelapse folder in {camera_name}...")
-        logger.info(f"🔍 Searching for 'timelapse' folder under {camera_name} (ID: {camera_folder['id']})")
-        timelapse_folder_id = find_or_create_folder(service, camera_folder['id'], TIMELAPSE_FOLDER_NAME)
-        logger.info(f"✅ Timelapse folder ready: {timelapse_folder_id}")
-        logger.info(f"📂 Video will be uploaded to: {domain_name}/{camera_name}/timelapse/ folder")
-        
-        # Process the selected domain/camera
-        logger.info(f"📷 Processing {domain_name}/{camera_name}...")
-        
-        try:
-            # Step 1: Synchronize images between Google Drive and local storage (if enabled)
-            if ENABLE_IMAGE_SYNC and SYNC_BEFORE_VIDEO:
-                logger.info("🔄 Step 1: Starting image synchronization...")
-                
-                # Get the image folder ID for the camera
-                image_folder_id = find_or_create_folder(service, camera_folder['id'], IMAGE_FOLDER_NAME)
-                logger.info(f"📁 {camera_name} image folder ID: {image_folder_id}")
-                
-                # Synchronize images (download new ones, cleanup old ones)
-                sync_result = synchronize_images(service, image_folder_id, domain_name, camera_name)
-                
-                if sync_result is None:
-                    logger.error("❌ Image synchronization failed, cannot proceed with video creation")
-                    return
-                
-                logger.info(f"✅ Image synchronization completed successfully")
-                logger.info(f"📊 Local storage now has {sync_result['count']} images")
-            else:
-                logger.info("⏭️ Image synchronization skipped (disabled or not required)")
-                sync_result = None
+        for pair_index, selected_pair in enumerate(domain_camera_pairs, 1):
+            domain_name = selected_pair['domain']
+            camera_name = selected_pair['camera']
+            camera_folder = {'id': selected_pair['folder_id'], 'name': camera_name}
             
-            # Step 2: Get images from local storage (already discovered above)
-            logger.info("📁 Step 2: Using images from local storage...")
-            image_paths = selected_pair['local_images']
+            logger.info(f"🎯 Processing {pair_index}/{len(domain_camera_pairs)}: {domain_name}/{camera_name} ({selected_pair['image_count']} images)")
             
-            if not image_paths:
-                logger.error(f"❌ No images found in local storage for {domain_name}/{camera_name}, cannot create timelapse")
-                return
+            # Reset timeout for each camera processing
+            reset_global_timeout(f"camera {pair_index}/{len(domain_camera_pairs)} ({camera_name})")
             
-            # Limit images to maximum allowed
-            if len(image_paths) > MAX_IMAGES_PER_VIDEO:
-                logger.info(f"Image count ({len(image_paths)}) exceeds maximum ({MAX_IMAGES_PER_VIDEO})")
-                logger.info(f"Limiting to first {MAX_IMAGES_PER_VIDEO} images")
-                image_paths = image_paths[:MAX_IMAGES_PER_VIDEO]
+            # Get or create the timelapse folder directly under the camera
+            logger.info(f"📁 Looking for timelapse folder in {camera_name}...")
+            logger.info(f"🔍 Searching for 'timelapse' folder under {camera_name} (ID: {camera_folder['id']})")
+            timelapse_folder_id = find_or_create_folder(service, camera_folder['id'], TIMELAPSE_FOLDER_NAME)
+            logger.info(f"✅ Timelapse folder ready: {timelapse_folder_id}")
+            logger.info(f"📂 Video will be uploaded to: {domain_name}/{camera_name}/timelapse/ folder")
             
-            logger.info(f"✅ Proceeding with {len(image_paths)} images from {domain_name}/{camera_name} for timelapse creation")
+            # Process the current domain/camera
+            logger.info(f"📷 Processing {domain_name}/{camera_name}...")
             
-            # Store the names of images that will be used in the video (for cleanup later)
-            used_image_names = [os.path.basename(image_path) for image_path in image_paths]
-            logger.info(f"📋 Images to be used in timelapse: {len(used_image_names)}")
-            
-            # Create video
-            logger.info("🎬 Step 3: Starting video creation process...")
-            output_video = os.path.join(TEMP_DIR, f"{camera_name}_timelapse_output.mp4")
-            
-            if create_video(image_paths, output_video, None):  # Duration not used with fixed FPS
-                # Generate video name with timestamp
-                video_name = f"timelapse_{now.strftime('%Y%m%d_%H%M%S')}.mp4"
-                
-                logger.info("🎬 Step 4: Video creation successful, starting upload...")
-                logger.info(f"📤 Uploading video to Google Drive folder ID: {timelapse_folder_id}")
-                
-                try:
-                    upload_video(service, timelapse_folder_id, output_video, video_name)
-                    logger.info(f"✅ Successfully created and uploaded {camera_name} timelapse video: {video_name}")
-                    logger.info(f"📁 Video uploaded to: {domain_name}/{camera_name}/timelapse/ folder in Google Drive")
-                    logger.info(f"🎯 Final location: {domain_name}/{camera_name}/timelapse/{video_name}")
+            try:
+                # Step 1: Synchronize images between Google Drive and local storage (if enabled)
+                if ENABLE_IMAGE_SYNC and SYNC_BEFORE_VIDEO:
+                    logger.info("🔄 Step 1: Starting image synchronization...")
+                    reset_global_timeout(f"image synchronization for {camera_name}")
                     
-                    # Step 5: Comprehensive overflow cleanup (ensure both locations stay within MAX_IMAGES_DOWNLOAD limit)
-                    logger.info("🧹 Step 5: Comprehensive overflow cleanup after video creation...")
-                    try:
-                        image_folder_id = find_or_create_folder(service, camera_folder['id'], IMAGE_FOLDER_NAME)
-                        overflow_cleanup_result = cleanup_overflow_images(
-                            service, 
-                            image_folder_id, 
-                            domain_name, 
-                            camera_name, 
-                            MAX_IMAGES_DOWNLOAD
-                        )
-                        logger.info(f"✅ Overflow cleanup completed:")
-                        logger.info(f"   • Local storage: {overflow_cleanup_result['local_removed']} images removed")
-                        logger.info(f"   • Google Drive: {overflow_cleanup_result['gd_removed']} images removed")
-                        logger.info(f"   • Total: {overflow_cleanup_result['total_removed']} images removed")
-                    except Exception as overflow_error:
-                        logger.warning(f"⚠️ Overflow cleanup failed: {str(overflow_error)}")
-                        logger.info("🔄 Continuing with final summary...")
-                        
-                except Exception as upload_error:
-                    logger.error(f"❌ Upload failed: {str(upload_error)}")
-                    logger.error(f"📁 Video file was created locally at: {output_video}")
-                    logger.error(f"💡 You can manually upload this file to Google Drive")
-                    logger.error(f"🔍 Upload error details: {type(upload_error).__name__}: {str(upload_error)}")
-                    # Don't re-raise - continue with cleanup
-            else:
-                logger.error(f"❌ Failed to create {camera_name} timelapse video")
+                    # Get the image folder ID for the camera
+                    image_folder_id = find_or_create_folder(service, camera_folder['id'], IMAGE_FOLDER_NAME)
+                    logger.info(f"📁 {camera_name} image folder ID: {image_folder_id}")
+                    
+                    # Synchronize images (download new ones, cleanup old ones)
+                    sync_result = synchronize_images(service, image_folder_id, domain_name, camera_name)
+                    
+                    if sync_result is None:
+                        logger.error("❌ Image synchronization failed, cannot proceed with video creation")
+                        continue
+                    
+                    logger.info(f"✅ Image synchronization completed successfully")
+                    logger.info(f"📊 Local storage now has {sync_result['count']} images")
+                else:
+                    logger.info("⏭️ Image synchronization skipped (disabled or not required)")
+                    sync_result = None
                 
-        except Exception as e:
-            logger.error(f"❌ {camera_name} processing failed: {str(e)}")
-            import traceback
-            traceback.print_exc()
+                # Step 2: Get images from local storage (already discovered above)
+                logger.info("📁 Step 2: Using images from local storage...")
+                image_paths = selected_pair['local_images']
+                
+                if not image_paths:
+                    logger.error(f"❌ No images found in local storage for {domain_name}/{camera_name}, cannot create timelapse")
+                    continue
+                
+                # Limit images to maximum allowed
+                if len(image_paths) > MAX_IMAGES_PER_VIDEO:
+                    logger.info(f"Image count ({len(image_paths)}) exceeds maximum ({MAX_IMAGES_PER_VIDEO})")
+                    logger.info(f"Limiting to first {MAX_IMAGES_PER_VIDEO} images")
+                    image_paths = image_paths[:MAX_IMAGES_PER_VIDEO]
+                
+                logger.info(f"✅ Proceeding with {len(image_paths)} images from {domain_name}/{camera_name} for timelapse creation")
+                
+                # Store the names of images that will be used in the video (for cleanup later)
+                used_image_names = [os.path.basename(image_path) for image_path in image_paths]
+                logger.info(f"📋 Images to be used in timelapse: {len(used_image_names)}")
+                
+                # Create video
+                logger.info("🎬 Step 3: Starting video creation process...")
+                reset_global_timeout(f"video creation for {camera_name}")
+                output_video = os.path.join(TEMP_DIR, f"{camera_name}_timelapse_output.mp4")
+                
+                if create_video(image_paths, output_video, None):  # Duration not used with fixed FPS
+                    # Generate video name with timestamp
+                    video_name = f"timelapse_{now.strftime('%Y%m%d_%H%M%S')}.mp4"
+                    
+                    logger.info("🎬 Step 4: Video creation successful, starting upload...")
+                    logger.info(f"📤 Uploading video to Google Drive folder ID: {timelapse_folder_id}")
+                    reset_global_timeout(f"video upload for {camera_name}")
+                    
+                    try:
+                        upload_video(service, timelapse_folder_id, output_video, video_name)
+                        logger.info(f"✅ Successfully created and uploaded {camera_name} timelapse video: {video_name}")
+                        logger.info(f"📁 Video uploaded to: {domain_name}/{camera_name}/timelapse/ folder in Google Drive")
+                        logger.info(f"🎯 Final location: {domain_name}/{camera_name}/timelapse/{video_name}")
+                        
+                        # Step 5: Comprehensive overflow cleanup (ensure both locations stay within MAX_IMAGES_DOWNLOAD limit)
+                        logger.info("🧹 Step 5: Comprehensive overflow cleanup after video creation...")
+                        reset_global_timeout(f"overflow cleanup for {camera_name}")
+                        try:
+                            image_folder_id = find_or_create_folder(service, camera_folder['id'], IMAGE_FOLDER_NAME)
+                            overflow_cleanup_result = cleanup_overflow_images(
+                                service, 
+                                image_folder_id, 
+                                domain_name, 
+                                camera_name, 
+                                MAX_IMAGES_DOWNLOAD
+                            )
+                            logger.info(f"✅ Overflow cleanup completed:")
+                            logger.info(f"   • Local storage: {overflow_cleanup_result['local_removed']} images removed")
+                            logger.info(f"   • Google Drive: {overflow_cleanup_result['gd_removed']} images removed")
+                            logger.info(f"   • Total: {overflow_cleanup_result['total_removed']} images removed")
+                        except Exception as overflow_error:
+                            logger.warning(f"⚠️ Overflow cleanup failed: {str(overflow_error)}")
+                            logger.info("🔄 Continuing with final summary...")
+                            
+                    except Exception as upload_error:
+                        logger.error(f"❌ Upload failed: {str(upload_error)}")
+                        logger.error(f"📁 Video file was created locally at: {output_video}")
+                        logger.error(f"💡 You can manually upload this file to Google Drive")
+                        logger.error(f"🔍 Upload error details: {type(upload_error).__name__}: {str(upload_error)}")
+                        # Don't re-raise - continue with cleanup
+                else:
+                    logger.error(f"❌ Failed to create {camera_name} timelapse video")
+                    
+            except Exception as e:
+                logger.error(f"❌ {camera_name} processing failed: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                continue  # Skip this camera and move to the next one
+            
+            # Individual camera summary
+            logger.info("=" * 50)
+            logger.info(f"=== {domain_name.upper()}/{camera_name.upper()} TIMELAPSE CREATION COMPLETED ===")
+            if ENABLE_IMAGE_SYNC and SYNC_BEFORE_VIDEO and sync_result:
+                logger.info(f"📊 Final image count in local storage: {sync_result['count']}")
+                logger.info(f"📁 Local storage size: {sync_result['size'] / (1024*1024):.2f} MB")
+            logger.info(f"📂 Local storage path: {LOCAL_IMAGE_FOLDER}/{domain_name}/{camera_name}/")
+            logger.info("=" * 50)
         
-        # Final summary
-        logger.info("=" * 50)
-        logger.info(f"=== {domain_name.upper()}/{camera_name.upper()} TIMELAPSE CREATION COMPLETED ===")
-        if ENABLE_IMAGE_SYNC and SYNC_BEFORE_VIDEO and sync_result:
-            logger.info(f"📊 Final image count in local storage: {sync_result['count']}")
-            logger.info(f"📁 Local storage size: {sync_result['size'] / (1024*1024):.2f} MB")
-        logger.info(f"📂 Local storage path: {LOCAL_IMAGE_FOLDER}/{domain_name}/{camera_name}/")
-        logger.info("=" * 50)
+        # Final overall summary
+        logger.info("=" * 60)
+        logger.info(f"=== ALL {len(domain_camera_pairs)} CAMERAS PROCESSING COMPLETED ===")
+        logger.info(f"📊 Total cameras processed: {len(domain_camera_pairs)}")
+        logger.info(f"📂 Local storage base path: {LOCAL_IMAGE_FOLDER}")
+        logger.info("=" * 60)
         
     except Exception as e:
         logger.error(f"Critical error: {str(e)}")
